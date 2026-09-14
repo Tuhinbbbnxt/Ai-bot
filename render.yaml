@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: riyad-the-ai
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+
+    envVars:
+      - key: NXT_API_KEY
+        sync: false
+
+      - key: BOT_NAME
+        value: RIYAD THE AI
+
+      - key: OWNER_NAME
+        sync: false
+
+      - key: OWNER_WORK
+        sync: false
+
+      - key: OWNER_ABOUT
+        sync: false
+
+      - key: AUTH_DIR
+        value: /opt/render/project/src/auth_info
