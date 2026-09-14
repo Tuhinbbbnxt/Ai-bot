@@ -1,1033 +1,559 @@
-require('dotenv').config();
+require("dotenv").config();
 
-const express = require('express');
-const axios = require('axios');
-const pino = require('pino');
-const path = require('path');
-const fs = require('fs');
+const express = require("express");
+const axios = require("axios");
+const pino = require("pino");
+const fs = require("fs");
+const path = require("path");
 
 const {
   default: makeWASocket,
   useMultiFileAuthState,
-  delay,
-  fetchLatestBaileysVersion,
-  DisconnectReason
-} = require('@whiskeysockets/baileys');
+  DisconnectReason,
+  fetchLatestBaileysVersion
+} = require("@whiskeysockets/baileys");
 
-const { Boom } = require('@hapi/boom');
+const { Boom } = require("@hapi/boom");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+app.use(express.json());
+
+const PORT = process.env.PORT || 10000;
 
 const AUTH_DIR =
-  process.env.AUTH_DIR || path.join(__dirname, 'auth_info');
-
-const API_KEY = process.env.NXT_API_KEY;
-
-const API_URL =
-  'https://nxtai.zipohostbd.workers.dev/api/use?gem=c477280c-3abb-4a93-8b8a-fdc8e56830dc';
-
-/* =========================
-   BOT INFORMATION
-========================= */
+  process.env.AUTH_DIR || path.join(__dirname, "auth_info");
 
 const BOT_NAME =
-  process.env.BOT_NAME || 'RIYAD THE AI';
+  process.env.BOT_NAME || "RIYAD THE AI";
 
-const OWNER_INFO = `
-নাম: ${process.env.OWNER_NAME || ''}
-আমি কী করি: ${process.env.OWNER_WORK || ''}
-আমার সম্পর্কে: ${process.env.OWNER_ABOUT || ''}
-`;
+const OWNER_NAME =
+  process.env.OWNER_NAME || "";
 
-/* =========================
-   SERVER STATE
-========================= */
+const OWNER_WORK =
+  process.env.OWNER_WORK || "";
 
-let logs = [];
+const OWNER_ABOUT =
+  process.env.OWNER_ABOUT || "";
 
+const NXT_API_KEY =
+  process.env.NXT_API_KEY || "";
+
+// তোমার দেওয়া নতুন GEM ID
+const NXT_GEM =
+  process.env.NXT_GEM ||
+  "ba0fbe0d-976e-493a-afdb-6d8469e53df0";
+
+const profilesFile = path.join(__dirname, "profiles.json");
+const contactsFile = path.join(__dirname, "contacts.json");
+
+let sock = null;
+let pairingInProgress = false;
 let botEnabled = true;
 let offlineMode = false;
+let waStatus = "OFFLINE";
+let waPhone = null;
+let lastError = null;
 
-let waSocket = null;
-let waConnected = false;
-let waStarting = false;
-let waPhoneNumber = null;
-let pairingCode = null;
+// --------------------------------------------------
+// Profiles
+// --------------------------------------------------
 
-let reconnectTimer = null;
+const defaultProfiles = {
+  default: {
+    name: "সাধারণ",
+    instruction: "ভদ্র, স্বাভাবিক এবং সংক্ষিপ্তভাবে উত্তর দাও।"
+  },
 
-/* =========================
-   LOG
-========================= */
+  friend: {
+    name: "বন্ধু",
+    instruction:
+      "বন্ধুর মতো সহজ, স্বাভাবিক ও casual ভাষায় কথা বলো। বন্ধুত্বপূর্ণ হও, কিন্তু অশালীন বা অপমানজনক ভাষা ব্যবহার করো না।"
+  },
 
-function log(message) {
-  const time = new Date().toLocaleTimeString('bn-BD');
-  const line = `[${time}] ${message}`;
+  family: {
+    name: "পরিবার",
+    instruction:
+      "পরিবারের সদস্যের সঙ্গে আন্তরিক, ভদ্র ও স্বাভাবিকভাবে কথা বলো।"
+  },
 
-  console.log(line);
+  sir: {
+    name: "স্যার",
+    instruction:
+      "অত্যন্ত ভদ্র ও সম্মানজনক ভাষায় উত্তর দাও। প্রয়োজন ছাড়া casual ভাষা ব্যবহার করো না।"
+  },
 
-  logs.push(line);
+  unknown: {
+    name: "অপরিচিত",
+    instruction:
+      "অপরিচিত ব্যক্তির সঙ্গে সংক্ষিপ্ত, ভদ্র ও সতর্কভাবে কথা বলো।"
+  },
 
-  if (logs.length > 200) {
-    logs = logs.slice(-200);
+  offline: {
+    name: "অফলাইন",
+    instruction:
+      "জানাও যে RIYAD বর্তমানে ফোনে নেই এবং পরে উত্তর দিতে পারে। সংক্ষিপ্ত ও স্বাভাবিকভাবে উত্তর দাও।"
   }
-}
+};
 
-/* =========================
-   PROFILES
-========================= */
-
-const profilesFile =
-  path.join(__dirname, 'profiles.json');
-
-const contactsFile =
-  path.join(__dirname, 'contacts.json');
-
-function readJSON(file, fallback) {
+function loadJSON(file, fallback) {
   try {
-    if (!fs.existsSync(file)) {
-      return fallback;
+    if (fs.existsSync(file)) {
+      return JSON.parse(fs.readFileSync(file, "utf8"));
     }
+  } catch (e) {
+    console.log("JSON load error:", e.message);
+  }
 
-    return JSON.parse(
-      fs.readFileSync(file, 'utf8')
+  return fallback;
+}
+
+function saveJSON(file, data) {
+  try {
+    fs.writeFileSync(
+      file,
+      JSON.stringify(data, null, 2),
+      "utf8"
     );
-  } catch (error) {
-    log(`JSON read error: ${error.message}`);
-    return fallback;
+  } catch (e) {
+    console.log("JSON save error:", e.message);
   }
 }
 
-function writeJSON(file, data) {
-  fs.writeFileSync(
-    file,
-    JSON.stringify(data, null, 2),
-    'utf8'
-  );
-}
+let profiles = loadJSON(profilesFile, defaultProfiles);
+let contacts = loadJSON(contactsFile, {});
 
-let profiles = readJSON(
-  profilesFile,
-  {
-    default: {
-      name: 'Default',
-      instruction:
-        'ভদ্র, স্বাভাবিক এবং সংক্ষিপ্তভাবে উত্তর দাও।'
-    },
+// --------------------------------------------------
+// AI
+// --------------------------------------------------
 
-    friend: {
-      name: 'বন্ধু',
-      instruction:
-        'বন্ধুর মতো সহজ, স্বাভাবিক এবং casual ভাষায় উত্তর দাও।'
-    },
+async function askAI(message, profileKey) {
+  const profile =
+    profiles[profileKey] ||
+    profiles.default ||
+    defaultProfiles.default;
 
-    family: {
-      name: 'পরিবার',
-      instruction:
-        'আন্তরিক, ভদ্র এবং স্বাভাবিকভাবে উত্তর দাও।'
-    },
+  const systemInfo = `
+তুমি ${BOT_NAME}-এর ব্যক্তিগত AI assistant।
 
-    sir: {
-      name: 'স্যার',
-      instruction:
-        'অত্যন্ত ভদ্র ও সম্মানজনক ভাষায় উত্তর দাও।'
-    },
+Owner name: ${OWNER_NAME}
+Owner work: ${OWNER_WORK}
+Owner about: ${OWNER_ABOUT}
 
-    unknown: {
-      name: 'অপরিচিত',
-      instruction:
-        'ভদ্র, সংক্ষিপ্ত এবং নিরাপদভাবে উত্তর দাও।'
-    }
-  }
-);
-
-let contacts = readJSON(
-  contactsFile,
-  {}
-);
-
-function saveProfiles() {
-  writeJSON(
-    profilesFile,
-    profiles
-  );
-}
-
-function saveContacts() {
-  writeJSON(
-    contactsFile,
-    contacts
-  );
-}
-
-/* =========================
-   CONTACT SETTINGS
-========================= */
-
-function getContactSettings(jid) {
-  return contacts[jid] || {
-    profile: 'default',
-    enabled: true
-  };
-}
-
-/* =========================
-   AI
-========================= */
-
-async function askAI(message, jid) {
-
-  if (!API_KEY) {
-    log('❌ NXT_API_KEY পাওয়া যায়নি');
-
-    return '⚠️ AI API key সেট করা হয়নি।';
-  }
-
-  const settings =
-    getContactSettings(jid);
-
-  let profile =
-    profiles[settings.profile] ||
-    profiles.default;
-
-  if (offlineMode) {
-    profile = {
-      name: 'Offline',
-      instruction:
-        'সংক্ষেপে জানাও যে RIYAD এখন ফোনে নেই এবং পরে উত্তর দেবে।'
-    };
-  }
-
-  const prompt = `
-তুমি "${BOT_NAME}" নামের একজন ব্যক্তিগত AI assistant।
-
-তোমার কাজ হলো আমার WhatsApp-এ আসা মেসেজের উত্তর তৈরি করা।
-
-আমার তথ্য:
-${OWNER_INFO}
-
-বর্তমান ব্যক্তির profile:
-${profile.name}
-
-এই ব্যক্তির জন্য বিশেষ নির্দেশনা:
+Reply style:
 ${profile.instruction}
 
-নিয়ম:
-- ব্যবহারকারী যে ভাষায় লিখবে সেই ভাষায় উত্তর দাও।
-- বাংলা হলে বাংলা ভাষায় উত্তর দাও।
-- English হলে English-এ উত্তর দাও।
+নির্দেশনা:
 - স্বাভাবিকভাবে উত্তর দাও।
-- অপ্রয়োজনীয় বড় উত্তর দিও না।
-- কোনো তথ্য নিশ্চিতভাবে জানা না থাকলে বানিয়ে বলবে না।
-- নিজেকে AI বলে অপ্রয়োজনে পরিচয় দিও না।
-- আমার ব্যক্তিগত তথ্য প্রয়োজন ছাড়া প্রকাশ করো না।
-
-ব্যবহারকারীর মেসেজ:
-${message}
+- প্রয়োজন ছাড়া নিজের পরিচয় দিও না।
+- Owner-এর ব্যক্তিগত বা সংবেদনশীল তথ্য অযথা প্রকাশ করো না।
+- ব্যবহারকারীর ভাষা অনুযায়ী বাংলা/ইংরেজিতে উত্তর দাও।
 `;
 
-  try {
-
-    const response =
-      await axios.post(
-        API_URL,
-        {
-          api_key: API_KEY,
-          message: prompt
-        },
-        {
-          headers: {
-            'Content-Type':
-              'application/json',
-
-            Accept:
-              'application/json'
-          },
-
-          timeout: 30000
-        }
-      );
-
-    const data =
-      response.data;
-
-    return (
-      data.message ||
-      data.response ||
-      data.reply ||
-      data.text ||
-      data.content ||
-      '⚠️ কোনো উত্তর পাওয়া যায়নি।'
-    );
-
-  } catch (error) {
-
-    log(
-      '❌ AI Error: ' +
-      (error.response?.status ||
-        error.message)
-    );
-
-    return (
-      '⚠️ দুঃখিত, এখন AI সার্ভারে সমস্যা হচ্ছে।'
-    );
+  if (!NXT_API_KEY) {
+    throw new Error("NXT_API_KEY is not configured");
   }
+
+  const url =
+    `https://nxtai.zipohostbd.workers.dev/api/use?gem=${encodeURIComponent(NXT_GEM)}`;
+
+  const response = await axios.post(
+    url,
+    {
+      api_key: NXT_API_KEY,
+      message: `${systemInfo}\n\nUser message:\n${message}`
+    },
+    {
+      timeout: 60000,
+      headers: {
+        "Content-Type": "application/json"
+      }
+    }
+  );
+
+  const data = response.data;
+
+  if (typeof data === "string") {
+    return data;
+  }
+
+  return (
+    data?.response ||
+    data?.message ||
+    data?.reply ||
+    data?.result ||
+    data?.text ||
+    "দুঃখিত, এখন উত্তর দিতে পারছি না।"
+  );
 }
 
-/* =========================
-   HEALTH
-========================= */
-
-app.get('/health', (req, res) => {
-
-  res.json({
-    status: 'ok',
-
-    whatsapp:
-      waConnected
-        ? 'connected'
-        : waStarting
-        ? 'pairing'
-        : 'offline',
-
-    botEnabled,
-
-    offlineMode,
-
-    uptime:
-      Math.floor(process.uptime())
-  });
-
-});
-
-/* =========================
-   STATUS
-========================= */
-
-app.get('/api/status', (req, res) => {
-
-  res.json({
-
-    botName: BOT_NAME,
-
-    whatsapp:
-      waConnected
-        ? 'connected'
-        : waStarting
-        ? 'pairing'
-        : 'offline',
-
-    phoneNumber:
-      waPhoneNumber,
-
-    pairingCode,
-
-    botEnabled,
-
-    offlineMode,
-
-    profiles,
-
-    contacts
-  });
-
-});
-
-/* =========================
-   BOT ON / OFF
-========================= */
-
-app.post('/api/bot/toggle', (req, res) => {
-
-  botEnabled =
-    !botEnabled;
-
-  log(
-    botEnabled
-      ? '🟢 Bot ON'
-      : '🔴 Bot OFF'
-  );
-
-  res.json({
-    ok: true,
-    botEnabled
-  });
-
-});
-
-/* =========================
-   OFFLINE MODE
-========================= */
-
-app.post('/api/offline/toggle', (req, res) => {
-
-  offlineMode =
-    !offlineMode;
-
-  log(
-    offlineMode
-      ? '🌙 Offline mode ON'
-      : '☀️ Offline mode OFF'
-  );
-
-  res.json({
-    ok: true,
-    offlineMode
-  });
-
-});
-
-/* =========================
-   CONTACT PROFILE
-========================= */
-
-app.post('/api/contact', (req, res) => {
-
-  const jid =
-    String(
-      req.body?.jid || ''
-    ).trim();
-
-  const profile =
-    String(
-      req.body?.profile || 'default'
-    ).trim();
-
-  const enabled =
-    req.body?.enabled !== false;
-
-  if (!jid) {
-
-    return res.status(400).json({
-      error: 'jid required'
-    });
-
-  }
-
-  if (!profiles[profile]) {
-
-    return res.status(400).json({
-      error: 'Profile not found'
-    });
-
-  }
-
-  contacts[jid] = {
-    profile,
-    enabled
-  };
-
-  saveContacts();
-
-  log(
-    `👤 ${jid} → ${profile}`
-  );
-
-  res.json({
-    ok: true,
-    contact: contacts[jid]
-  });
-
-});
-
-/* =========================
-   CREATE PROFILE
-========================= */
-
-app.post('/api/profile', (req, res) => {
-
-  const id =
-    String(
-      req.body?.id || ''
-    )
-    .trim()
-    .toLowerCase();
-
-  const name =
-    String(
-      req.body?.name || ''
-    ).trim();
-
-  const instruction =
-    String(
-      req.body?.instruction || ''
-    ).trim();
-
-  if (!id || !name || !instruction) {
-
-    return res.status(400).json({
-      error:
-        'id, name এবং instruction প্রয়োজন'
-    });
-
-  }
-
-  profiles[id] = {
-    name,
-    instruction
-  };
-
-  saveProfiles();
-
-  log(
-    `🧠 Profile created: ${id}`
-  );
-
-  res.json({
-    ok: true,
-    profile: profiles[id]
-  });
-
-});
-
-/* =========================
-   START WHATSAPP
-========================= */
-
-app.post('/api/wa/start', async (req, res) => {
-
-  const phone =
-    String(
-      req.body?.phone || ''
-    )
-    .replace(/\D/g, '');
-
-  if (!phone || phone.length < 8) {
-
-    return res.status(400).json({
-      error:
-        'Country code সহ সঠিক নম্বর দিন।'
-    });
-
-  }
-
-  if (waConnected) {
-
-    return res.json({
-      ok: true,
-      message:
-        'WhatsApp ইতিমধ্যে connected',
-      phone:
-        waPhoneNumber
-    });
-
-  }
-
-  if (waStarting) {
-
-    return res.json({
-      ok: true,
-      message:
-        'Pairing চলছে',
-      pairingCode
-    });
-
-  }
-
-  waPhoneNumber =
-    phone;
-
-  waStarting = true;
-  pairingCode = null;
-
-  log(
-    `📱 WhatsApp pairing শুরু: ${phone}`
-  );
-
-  startWhatsApp()
-    .catch(error => {
-
-      log(
-        '❌ WhatsApp error: ' +
-        error.message
-      );
-
-      waStarting = false;
-
-    });
-
-  res.json({
-    ok: true,
-    message:
-      'Pairing শুরু হয়েছে'
-  });
-
-});
-
-/* =========================
-   RESET
-========================= */
-
-app.post('/api/wa/reset', (req, res) => {
-
-  try {
-
-    if (waSocket) {
-
-      try {
-        waSocket.end();
-      } catch (_) {}
-
-      waSocket = null;
-    }
-
-    if (
-      fs.existsSync(AUTH_DIR)
-    ) {
-
-      fs.rmSync(
-        AUTH_DIR,
-        {
-          recursive: true,
-          force: true
-        }
-      );
-
-    }
-
-    waConnected = false;
-    waStarting = false;
-    pairingCode = null;
-    waPhoneNumber = null;
-
-    log(
-      '🧹 WhatsApp session reset'
-    );
-
-    res.json({
-      ok: true
-    });
-
-  } catch (error) {
-
-    res.status(500).json({
-      error:
-        error.message
-    });
-
-  }
-
-});
-
-/* =========================
-   WHATSAPP BOT
-========================= */
+// --------------------------------------------------
+// WhatsApp
+// --------------------------------------------------
 
 async function startWhatsApp() {
+  if (!fs.existsSync(AUTH_DIR)) {
+    fs.mkdirSync(AUTH_DIR, { recursive: true });
+  }
 
-  fs.mkdirSync(
-    AUTH_DIR,
-    {
-      recursive: true
-    }
-  );
-
-  const {
-    state,
-    saveCreds
-  } =
-    await useMultiFileAuthState(
-      AUTH_DIR
-    );
+  const { state, saveCreds } =
+    await useMultiFileAuthState(AUTH_DIR);
 
   let version;
 
   try {
-
-    const result =
-      await fetchLatestBaileysVersion();
-
-    version =
-      result.version;
-
-    log(
-      `📦 Baileys: ${version.join('.')}`
-    );
-
+    const latest = await fetchLatestBaileysVersion();
+    version = latest.version;
   } catch {
-
-    version =
-      [2, 3000, 1020576855];
-
-    log(
-      '⚠️ Baileys fallback version'
-    );
-
+    version = [2, 3000, 1015901307];
   }
 
-  const sock =
-    makeWASocket({
-
-      version,
-
-      auth: state,
-
-      logger:
-        pino({
-          level: 'silent'
-        }),
-
-      printQRInTerminal:
-        false,
-
-      browser: [
-        'RIYAD THE AI',
-        'Chrome',
-        '1.0'
-      ],
-
-      connectTimeoutMs:
-        60000,
-
-      defaultQueryTimeoutMs:
-        30000,
-
-      keepAliveIntervalMs:
-        25000,
-
-      markOnlineOnConnect:
-        true
-    });
-
-  waSocket =
-    sock;
-
-  sock.ev.on(
-    'creds.update',
-    saveCreds
-  );
-
-  /* Pairing */
-
-  if (
-    !sock.authState.creds.registered
-  ) {
-
-    if (!waPhoneNumber) {
-
-      log(
-        '⚠️ WhatsApp number পাওয়া যায়নি'
-      );
-
-      waStarting = false;
-
-      return;
-    }
-
-    try {
-
-      await delay(3000);
-
-      pairingCode =
-        await sock.requestPairingCode(
-          waPhoneNumber
-        );
-
-      log(
-        `🔑 Pairing code: ${pairingCode}`
-      );
-
-    } catch (error) {
-
-      log(
-        '❌ Pairing error: ' +
-        error.message
-      );
-
-      waStarting = false;
-
-      return;
-    }
-
-  }
-
-  /* Connection */
-
-  sock.ev.on(
-    'connection.update',
-    update => {
-
-      const {
-        connection,
-        lastDisconnect
-      } = update;
-
-      if (
-        connection === 'open'
-      ) {
-
-        waConnected = true;
-        waStarting = false;
-        pairingCode = null;
-
-        log(
-          '🎉 RIYAD THE AI ONLINE!'
-        );
-
-      }
-
-      if (
-        connection === 'close'
-      ) {
-
-        waConnected = false;
-
-        const code =
-          new Boom(
-            lastDisconnect?.error
-          )
-          ?.output
-          ?.statusCode;
-
-        if (
-          code ===
-          DisconnectReason.loggedOut
-        ) {
-
-          log(
-            '🚪 WhatsApp logged out'
-          );
-
-          waStarting = false;
-
-          return;
-        }
-
-        if (reconnectTimer) {
-          return;
-        }
-
-        log(
-          `🔄 Connection closed: ${code}`
-        );
-
-        waStarting = true;
-
-        reconnectTimer =
-          setTimeout(() => {
-
-            reconnectTimer = null;
-
-            startWhatsApp()
-              .catch(error => {
-
-                log(
-                  '❌ Reconnect error: ' +
-                  error.message
-                );
-
-                waStarting = false;
-
-              });
-
-          }, 5000);
-
-      }
-
-    }
-  );
-
-  /* Messages */
-
-  const seenMessages =
-    new Set();
-
-  const busyChats =
-    new Set();
-
-  sock.ev.on(
-    'messages.upsert',
-    async ({
-      messages
-    }) => {
-
-      const msg =
-        messages[0];
-
-      if (
-        !msg?.message ||
-        msg.key.fromMe
-      ) {
-        return;
-      }
-
-      const jid =
-        msg.key.remoteJid;
-
-      const text =
-        msg.message.conversation ||
-        msg.message
-          ?.extendedTextMessage
-          ?.text ||
-        '';
-
-      if (!text.trim()) {
-        return;
-      }
-
-      const messageId =
-        msg.key.id;
-
-      if (
-        seenMessages.has(
-          messageId
-        )
-      ) {
-        return;
-      }
-
-      seenMessages.add(
-        messageId
-      );
-
-      if (
-        seenMessages.size > 500
-      ) {
-        seenMessages.clear();
-      }
-
-      log(
-        `📩 ${jid}: ${text}`
-      );
-
-      /* Bot OFF */
-
-      if (!botEnabled) {
-
-        log(
-          '⏭️ Bot OFF'
-        );
-
-        return;
-      }
-
-      /* Contact settings */
-
-      const settings =
-        getContactSettings(
-          jid
-        );
-
-      if (
-        settings.enabled === false
-      ) {
-
-        log(
-          `⏭️ Reply disabled: ${jid}`
-        );
-
-        return;
-      }
-
-      /* Prevent duplicate processing */
-
-      if (
-        busyChats.has(jid)
-      ) {
-
-        log(
-          `⏭️ Busy chat: ${jid}`
-        );
-
-        return;
-      }
-
-      busyChats.add(jid);
+  sock = makeWASocket({
+    version,
+    auth: state,
+    logger: pino({ level: "silent" }),
+    printQRInTerminal: false,
+    browser: ["RIYAD THE AI", "Chrome", "1.0.0"],
+    generateHighQualityLinkPreview: false
+  });
+
+  sock.ev.on("creds.update", saveCreds);
+
+  sock.ev.on("connection.update", async (update) => {
+    const {
+      connection,
+      lastDisconnect
+    } = update;
+
+    if (connection === "open") {
+      waStatus = "ONLINE";
+      pairingInProgress = false;
+      lastError = null;
 
       try {
-
-        try {
-
-          await sock.readMessages([
-            msg.key
-          ]);
-
-        } catch (_) {}
-
-        try {
-
-          await sock.sendPresenceUpdate(
-            'composing',
-            jid
-          );
-
-        } catch (_) {}
-
-        const reply =
-          await askAI(
-            text,
-            jid
-          );
-
-        try {
-
-          await sock.sendPresenceUpdate(
-            'paused',
-            jid
-          );
-
-        } catch (_) {}
-
-        await sock.sendMessage(
-          jid,
-          {
-            text:
-              String(reply)
-          }
-        );
-
-        log(
-          `📤 Reply sent: ${jid}`
-        );
-
-      } catch (error) {
-
-        log(
-          '❌ Message error: ' +
-          error.message
-        );
-
-      } finally {
-
-        busyChats.delete(jid);
-
+        waPhone =
+          sock.user?.id?.split(":")[0] ||
+          sock.user?.id ||
+          null;
+      } catch {
+        waPhone = null;
       }
 
+      console.log("WhatsApp connected:", waPhone);
     }
-  );
+
+    if (connection === "close") {
+      waStatus = "OFFLINE";
+      waPhone = null;
+
+      const statusCode =
+        new Boom(lastDisconnect?.error)?.output?.statusCode;
+
+      console.log(
+        "WhatsApp connection closed:",
+        statusCode
+      );
+
+      if (
+        statusCode !== DisconnectReason.loggedOut &&
+        statusCode !== DisconnectReason.forbidden
+      ) {
+        setTimeout(() => {
+          startWhatsApp().catch((err) => {
+            lastError = err.message;
+            console.log("Reconnect error:", err.message);
+          });
+        }, 5000);
+      }
+    }
+  });
+
+  sock.ev.on("messages.upsert", async ({ messages }) => {
+    try {
+      const msg = messages?.[0];
+
+      if (!msg || !msg.message) return;
+
+      if (msg.key.fromMe) return;
+
+      const remoteJid = msg.key.remoteJid;
+
+      if (!remoteJid || remoteJid.endsWith("@g.us")) {
+        return;
+      }
+
+      const messageText =
+        msg.message.conversation ||
+        msg.message.extendedTextMessage?.text ||
+        "";
+
+      if (!messageText.trim()) return;
+
+      console.log(
+        "Incoming message:",
+        remoteJid,
+        messageText
+      );
+
+      if (!botEnabled) return;
+
+      let profileKey =
+        contacts[remoteJid] || "default";
+
+      if (offlineMode) {
+        profileKey = "offline";
+      }
+
+      // typing indicator
+      try {
+        await sock.sendPresenceUpdate(
+          "composing",
+          remoteJid
+        );
+      } catch {}
+
+      const reply = await askAI(
+        messageText,
+        profileKey
+      );
+
+      if (!reply) return;
+
+      await sock.sendMessage(remoteJid, {
+        text: String(reply)
+      });
+
+      try {
+        await sock.sendPresenceUpdate(
+          "paused",
+          remoteJid
+        );
+      } catch {}
+    } catch (err) {
+      lastError = err.message;
+      console.log(
+        "Message handling error:",
+        err.message
+      );
+    }
+  });
 }
 
-/* =========================
-   DASHBOARD
-========================= */
+// --------------------------------------------------
+// API
+// --------------------------------------------------
 
-app.get('/', (req, res) => {
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    whatsapp: waStatus,
+    bot: botEnabled,
+    offline: offlineMode
+  });
+});
 
-  const status =
-    waConnected
-      ? '🟢 CONNECTED'
-      : waStarting
-      ? '🟡 PAIRING'
-      : '🔴 OFFLINE';
+app.get("/api/status", (req, res) => {
+  res.json({
+    whatsapp: waStatus,
+    phone: waPhone,
+    bot: botEnabled,
+    offline: offlineMode,
+    pairing: pairingInProgress,
+    error: lastError
+  });
+});
 
-  res.send(`
+app.post("/api/bot/toggle", (req, res) => {
+  botEnabled = !botEnabled;
 
-<!DOCTYPE html>
+  res.json({
+    ok: true,
+    bot: botEnabled
+  });
+});
 
+app.post("/api/offline/toggle", (req, res) => {
+  offlineMode = !offlineMode;
+
+  res.json({
+    ok: true,
+    offline: offlineMode
+  });
+});
+
+// --------------------------------------------------
+// Pairing
+// --------------------------------------------------
+
+app.post("/api/wa/start", async (req, res) => {
+  try {
+    const phone = String(req.body?.phone || "")
+      .replace(/\D/g, "");
+
+    if (!phone) {
+      return res.status(400).json({
+        ok: false,
+        error: "WhatsApp number is required"
+      });
+    }
+
+    if (waStatus === "ONLINE") {
+      return res.json({
+        ok: true,
+        status: "ONLINE",
+        phone: waPhone
+      });
+    }
+
+    if (pairingInProgress) {
+      return res.json({
+        ok: true,
+        pairing: true,
+        message:
+          "Pairing is already in progress. Please wait."
+      });
+    }
+
+    pairingInProgress = true;
+    lastError = null;
+
+    if (!sock) {
+      await startWhatsApp();
+    }
+
+    // Baileys needs the socket to initialize
+    await new Promise((resolve) =>
+      setTimeout(resolve, 2000)
+    );
+
+    if (sock?.authState?.creds?.registered) {
+      pairingInProgress = false;
+
+      return res.json({
+        ok: true,
+        status: "ONLINE",
+        phone: waPhone
+      });
+    }
+
+    const code =
+      await sock.requestPairingCode(phone);
+
+    pairingInProgress = false;
+
+    return res.json({
+      ok: true,
+      pairing: true,
+      code
+    });
+  } catch (err) {
+    pairingInProgress = false;
+    lastError = err.message;
+
+    console.log(
+      "Pairing error:",
+      err.stack || err.message
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error: err.message
+    });
+  }
+});
+
+app.post("/api/wa/reset", async (req, res) => {
+  try {
+    if (sock) {
+      try {
+        await sock.logout();
+      } catch {}
+    }
+
+    sock = null;
+    waStatus = "OFFLINE";
+    waPhone = null;
+
+    if (fs.existsSync(AUTH_DIR)) {
+      fs.rmSync(AUTH_DIR, {
+        recursive: true,
+        force: true
+      });
+    }
+
+    fs.mkdirSync(AUTH_DIR, {
+      recursive: true
+    });
+
+    res.json({
+      ok: true,
+      message: "WhatsApp session reset"
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err.message
+    });
+  }
+});
+
+// --------------------------------------------------
+// Contact Profile
+// --------------------------------------------------
+
+app.get("/api/profiles", (req, res) => {
+  res.json(profiles);
+});
+
+app.get("/api/contacts", (req, res) => {
+  res.json(contacts);
+});
+
+app.post("/api/contact", (req, res) => {
+  const jid = String(req.body?.jid || "").trim();
+  const profile = String(
+    req.body?.profile || "default"
+  ).trim();
+
+  if (!jid) {
+    return res.status(400).json({
+      ok: false,
+      error: "jid is required"
+    });
+  }
+
+  if (!profiles[profile]) {
+    return res.status(400).json({
+      ok: false,
+      error: "Invalid profile"
+    });
+  }
+
+  contacts[jid] = profile;
+  saveJSON(contactsFile, contacts);
+
+  res.json({
+    ok: true,
+    jid,
+    profile
+  });
+});
+
+// --------------------------------------------------
+// Dashboard
+// --------------------------------------------------
+
+app.get("/", (req, res) => {
+  res.send(`<!DOCTYPE html>
 <html lang="bn">
-
 <head>
-
 <meta charset="UTF-8">
-
-<meta name="viewport"
-content="width=device-width,initial-scale=1">
-
+<meta
+  name="viewport"
+  content="width=device-width,initial-scale=1.0"
+>
 <title>${BOT_NAME}</title>
 
 <style>
-
 * {
   box-sizing: border-box;
 }
@@ -1035,41 +561,59 @@ content="width=device-width,initial-scale=1">
 body {
   margin: 0;
   padding: 20px;
-  background: #05070d;
-  color: #e8f7ff;
+  background: #05070c;
+  color: #fff;
   font-family: Arial, sans-serif;
-  max-width: 800px;
-  margin-left: auto;
-  margin-right: auto;
+}
+
+.container {
+  max-width: 600px;
+  margin: auto;
 }
 
 h1 {
-  color: #00d4ff;
+  color: #00d9ff;
+  font-size: 30px;
+  margin-bottom: 25px;
 }
 
 .card {
   background: #111827;
-  border: 1px solid #26354a;
-  border-radius: 16px;
-  padding: 18px;
-  margin-bottom: 15px;
+  border: 1px solid #29354a;
+  border-radius: 20px;
+  padding: 22px;
+  margin-bottom: 20px;
+}
+
+h2 {
+  margin-top: 0;
+}
+
+.status {
+  font-size: 20px;
+  margin: 10px 0;
 }
 
 input,
 select,
-button,
-textarea {
+button {
   width: 100%;
-  padding: 13px;
-  margin-top: 8px;
-  border-radius: 10px;
-  border: 1px solid #334155;
-  background: #080d17;
+  padding: 15px;
+  margin-top: 12px;
+  border-radius: 12px;
+  border: 1px solid #344054;
+  font-size: 16px;
+}
+
+input,
+select {
+  background: #0b1220;
   color: white;
 }
 
 button {
-  background: #087fce;
+  background: #078bd6;
+  color: white;
   border: none;
   font-weight: bold;
 }
@@ -1078,266 +622,340 @@ button:active {
   transform: scale(.98);
 }
 
-.code {
-  font-size: 28px;
-  font-weight: bold;
-  letter-spacing: 6px;
-  color: #00ffae;
-  text-align: center;
+#pairCode {
+  margin-top: 15px;
   padding: 15px;
+  background: #071b2b;
+  border-radius: 12px;
+  text-align: center;
+  font-size: 24px;
+  letter-spacing: 3px;
+  display: none;
 }
 
-.log {
-  white-space: pre-wrap;
-  background: #020617;
-  padding: 12px;
-  border-radius: 10px;
-  max-height: 300px;
-  overflow: auto;
-  font-size: 12px;
+.small {
+  color: #aeb8c8;
+  font-size: 14px;
+  margin-top: 10px;
 }
-
-.green {
-  color: #00ff99;
-}
-
-.red {
-  color: #ff5577;
-}
-
-.yellow {
-  color: #ffd166;
-}
-
 </style>
-
 </head>
 
 <body>
 
+<div class="container">
+
 <h1>🤖 ${BOT_NAME}</h1>
 
 <div class="card">
+<h2>WhatsApp Status</h2>
 
-<h3>WhatsApp Status</h3>
-
-<p>${status}</p>
-
-<p>
-Phone:
-${waPhoneNumber || 'Not connected'}
-</p>
-
-${
-  pairingCode
-    ? `
-    <div class="code">
-      ${pairingCode}
-    </div>
-
-    <p>
-    WhatsApp → Settings → Linked Devices →
-    Link a Device → Link with phone number
-    </p>
-    `
-    : ''
-}
-
+<div class="status">
+<span id="statusDot">🔴</span>
+<span id="waStatus">OFFLINE</span>
 </div>
+
+<div>
+Phone:
+<span id="waPhone">Not connected</span>
+</div>
+</div>
+
 
 <div class="card">
 
-<h3>📱 WhatsApp Login</h3>
+<h2>📱 WhatsApp Login</h2>
 
 <input
-id="phone"
-placeholder="8801XXXXXXXXX"
-inputmode="numeric">
+  id="phone"
+  type="tel"
+  inputmode="numeric"
+  autocomplete="tel"
+  placeholder="8801XXXXXXXXX"
+/>
 
-<button onclick="startWA()">
+<button id="pairBtn">
 🚀 START PAIRING
 </button>
 
+<div id="pairCode"></div>
+
+<div id="pairMessage" class="small"></div>
+
 </div>
+
 
 <div class="card">
 
-<h3>⚙️ Bot Control</h3>
+<h2>⚙️ Bot Control</h2>
 
-<p>
+<div class="status">
 Bot:
-${botEnabled
-  ? '🟢 ON'
-  : '🔴 OFF'}
-</p>
+<span id="botStatus">🟢 ON</span>
+</div>
 
-<button onclick="toggleBot()">
+<button id="botBtn">
 BOT ON / OFF
 </button>
 
-<p>
+<div class="status">
 Offline Mode:
-${offlineMode
-  ? '🌙 ON'
-  : '☀️ OFF'}
-</p>
+<span id="offlineStatus">☀️ OFF</span>
+</div>
 
-<button onclick="toggleOffline()">
+<button id="offlineBtn">
 OFFLINE MODE ON / OFF
 </button>
 
 </div>
 
-<div class="card">
-
-<h3>👥 Contact Profile</h3>
-
-<p>
-এখানে পরে Dashboard থেকে
-ব্যক্তিভেদে profile নির্বাচন করা যাবে।
-</p>
-
-<p>
-Friend → বন্ধু
-<br>
-Family → পরিবার
-<br>
-Sir → স্যার
-<br>
-Default → সাধারণ
-</p>
-
-</div>
 
 <div class="card">
 
-<h3>📜 Logs</h3>
+<h2>👥 Contact Profile</h2>
 
-<div class="log">
-${logs
-  .slice(-40)
-  .reverse()
-  .join('\\n')}
+<p>
+Dashboard থেকে contact অনুযায়ী profile
+নির্বাচন করা যাবে।
+</p>
+
+<p>
+Friend → বন্ধু<br>
+Family → পরিবার<br>
+Sir → স্যার<br>
+Default → সাধারণ<br>
+Unknown → অপরিচিত
+</p>
+
 </div>
 
 </div>
+
 
 <script>
 
-async function startWA() {
+const phoneInput =
+  document.getElementById("phone");
+
+const pairBtn =
+  document.getElementById("pairBtn");
+
+const pairCode =
+  document.getElementById("pairCode");
+
+const pairMessage =
+  document.getElementById("pairMessage");
+
+
+// --------------------------------------
+// Pairing
+// --------------------------------------
+
+pairBtn.addEventListener("click", async () => {
 
   const phone =
-    document
-      .getElementById('phone')
-      .value
-      .trim();
+    phoneInput.value.replace(/\\D/g, "");
 
   if (!phone) {
-    alert('WhatsApp number দিন');
+    pairMessage.textContent =
+      "প্রথমে WhatsApp নম্বর লিখুন।";
     return;
   }
 
-  await fetch(
-    '/api/wa/start',
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type':
-          'application/json'
-      },
-      body:
-        JSON.stringify({
-          phone
+  pairBtn.disabled = true;
+  pairBtn.textContent = "⏳ PAIRING...";
+
+  pairCode.style.display = "none";
+  pairCode.textContent = "";
+
+  pairMessage.textContent =
+    "Pairing code তৈরি হচ্ছে...";
+
+  try {
+
+    const response =
+      await fetch("/api/wa/start", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          phone: phone
         })
+      });
+
+    const data =
+      await response.json();
+
+    if (data.ok && data.code) {
+
+      pairCode.textContent =
+        data.code;
+
+      pairCode.style.display =
+        "block";
+
+      pairMessage.textContent =
+        "এই code WhatsApp-এর Link with phone number অপশনে ব্যবহার করুন।";
+
+    } else if (data.status === "ONLINE") {
+
+      pairMessage.textContent =
+        "✅ WhatsApp ইতিমধ্যে connected.";
+
+    } else {
+
+      pairMessage.textContent =
+        "❌ " +
+        (data.error ||
+        "Pairing শুরু করা যায়নি।");
+
     }
-  );
 
-  location.reload();
+  } catch (error) {
 
+    pairMessage.textContent =
+      "❌ Server error: " +
+      error.message;
+
+  } finally {
+
+    pairBtn.disabled = false;
+    pairBtn.textContent =
+      "🚀 START PAIRING";
+
+  }
+
+});
+
+
+// --------------------------------------
+// Bot toggle
+// --------------------------------------
+
+document
+  .getElementById("botBtn")
+  .addEventListener("click", async () => {
+
+    await fetch("/api/bot/toggle", {
+      method: "POST"
+    });
+
+    updateStatus();
+  });
+
+
+// --------------------------------------
+// Offline toggle
+// --------------------------------------
+
+document
+  .getElementById("offlineBtn")
+  .addEventListener("click", async () => {
+
+    await fetch("/api/offline/toggle", {
+      method: "POST"
+    });
+
+    updateStatus();
+  });
+
+
+// --------------------------------------
+// Status update
+// IMPORTANT:
+// Page reload করা হচ্ছে না.
+// শুধু text update হচ্ছে.
+// --------------------------------------
+
+async function updateStatus() {
+
+  try {
+
+    const response =
+      await fetch("/api/status", {
+        cache: "no-store"
+      });
+
+    const data =
+      await response.json();
+
+    const online =
+      data.whatsapp === "ONLINE";
+
+    document.getElementById(
+      "waStatus"
+    ).textContent =
+      online ? "ONLINE" : "OFFLINE";
+
+    document.getElementById(
+      "statusDot"
+    ).textContent =
+      online ? "🟢" : "🔴";
+
+    document.getElementById(
+      "waPhone"
+    ).textContent =
+      data.phone ||
+      "Not connected";
+
+    document.getElementById(
+      "botStatus"
+    ).textContent =
+      data.bot ? "🟢 ON" : "🔴 OFF";
+
+    document.getElementById(
+      "offlineStatus"
+    ).textContent =
+      data.offline ? "🌙 ON" : "☀️ OFF";
+
+  } catch (error) {
+    console.log(
+      "Status update error:",
+      error.message
+    );
+  }
 }
 
-async function toggleBot() {
 
-  await fetch(
-    '/api/bot/toggle',
-    {
-      method: 'POST'
-    }
-  );
+// প্রথম status
+updateStatus();
 
-  location.reload();
 
-}
-
-async function toggleOffline() {
-
-  await fetch(
-    '/api/offline/toggle',
-    {
-      method: 'POST'
-    }
-  );
-
-  location.reload();
-
-}
-
-setTimeout(
-  () => location.reload(),
-  5000
-);
+// প্রতি ৫ সেকেন্ডে শুধু status update হবে.
+// পুরো webpage reload হবে না.
+setInterval(updateStatus, 5000);
 
 </script>
 
 </body>
-
-</html>
-
-`);
-
+</html>`);
 });
 
-/* =========================
-   START SERVER
-========================= */
 
-app.listen(
-  PORT,
-  '0.0.0.0',
-  () => {
+// --------------------------------------------------
+// Start Server
+// --------------------------------------------------
 
-    log(
-      `🚀 Server running on port ${PORT}`
+app.listen(PORT, async () => {
+
+  console.log(
+    `🚀 Server running on port ${PORT}`
+  );
+
+  console.log(
+    `📁 Auth directory: ${AUTH_DIR}`
+  );
+
+  try {
+    await startWhatsApp();
+  } catch (err) {
+    lastError = err.message;
+
+    console.log(
+      "WhatsApp startup error:",
+      err.message
     );
-
-    log(
-      `📁 Auth directory: ${AUTH_DIR}`
-    );
-
-    if (
-      fs.existsSync(AUTH_DIR) &&
-      fs.readdirSync(AUTH_DIR).length > 0
-    ) {
-
-      log(
-        '🔁 Existing WhatsApp session found'
-      );
-
-      waStarting = true;
-
-      startWhatsApp()
-        .catch(error => {
-
-          log(
-            '❌ Resume error: ' +
-            error.message
-          );
-
-          waStarting = false;
-
-        });
-
-    }
-
   }
-);
+
+});
